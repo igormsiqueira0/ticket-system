@@ -162,7 +162,7 @@ public class SyncPrimitive implements Watcher {
         /**
          * Remove first element from the queue.
          */
-        int consume() throws KeeperException, InterruptedException{
+        String consume() throws KeeperException, InterruptedException{
             int retvalue = -1;
             Stat stat = null;
 
@@ -183,7 +183,7 @@ public class SyncPrimitive implements Watcher {
                         zk.delete(root + "/" + minString, -1);
                         ByteBuffer buffer = ByteBuffer.wrap(b);
                         retvalue = buffer.getInt();
-                        return retvalue;
+                        return minString;
                     }
                 }
             }
@@ -374,27 +374,13 @@ public class SyncPrimitive implements Watcher {
         int i;
         Integer max = Integer.valueOf(args[2]);
 
-        if (args[3].equals("p")) {
-            System.out.println("Producer");
-            for (i = 0; i < max; i++)
-                try{
-                    q.produce(10 + i);
-                } catch (KeeperException | InterruptedException e){
-                    e.printStackTrace();
-                }
-        } else {
-            System.out.println("Consumer");
-            for (i = 0; i < max; i++) {
-                try{
-                    int r = q.consume();
-                    System.out.println("Item: " + r);
-                } catch (KeeperException e){
-                    i--;
-                } catch (InterruptedException e){
-			    e.printStackTrace();
-                }
-            }
-        }
+        System.out.println("Producer");
+		for (i = 0; i < max; i++)
+			try{
+				q.produce(10 + i);
+			} catch (KeeperException | InterruptedException e){
+				e.printStackTrace();
+			}
     }
 
     public static void barrierTest(String args[]) {
@@ -446,7 +432,7 @@ public class SyncPrimitive implements Watcher {
     }
 
     /**
-     * New method for the worker process logic
+     * Lógica principal do processo worker, com reeleição estável.
      */
     public static void workerProcess(String args[]) {
         if (args.length < 3) {
@@ -456,84 +442,148 @@ public class SyncPrimitive implements Watcher {
         String zkAddress = args[1];
         int barrierSize = Integer.valueOf(args[2]);
         String barrierRoot = "/workers";
-        String activeWorkersRoot = "/activeworkers";
         String queueRoot = "/tickets";
         String lockRoot = "/work-lock";
+        String electionRoot = "/election";
         String workerId = "worker-" + new Random().nextInt(100000);
         System.out.println("Worker " + workerId + " iniciando...");
 
-        // Connect to ZK and ensure parent znodes exist
+        // Conexão e criação dos nós pais
         new SyncPrimitive(zkAddress);
         try {
             while (zk == null || !zk.getState().isConnected()) {
                 Thread.sleep(100);
             }
-            if (zk.exists(activeWorkersRoot, false) == null) {
-                zk.create(activeWorkersRoot, new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            for (String path : Arrays.asList(barrierRoot, queueRoot, lockRoot, electionRoot)) {
+                if (zk.exists(path, false) == null) {
+                    zk.create(path, new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                }
             }
-            if (zk.exists(lockRoot, false) == null) {
-                zk.create(lockRoot, new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-            }
-        } catch(KeeperException | InterruptedException e) {
+        } catch (KeeperException | InterruptedException e) {
             e.printStackTrace();
             return;
         }
 
-        // 1. Wait at the barrier (one-time startup synchronization)
+        // 1. Barreira de Sincronização
         Barrier b = new Barrier(zkAddress, barrierRoot, barrierSize);
         try {
             System.out.println(workerId + " esta esperando na barreira " + barrierRoot);
             b.enter();
             System.out.println(workerId + " passou da barreira. Pronto para trabalhar.");
         } catch (KeeperException | InterruptedException e) {
-            System.out.println(workerId + " falhou na barreira.");
             e.printStackTrace();
             return;
         }
 
-        // Worker's main processing loop
-        Queue ticketQueue = new Queue(zkAddress, queueRoot);
-        Lock workLock = new Lock(zkAddress, lockRoot);
-        String activeWorkerPath = activeWorkersRoot + "/" + workerId;
+        // 2. Entra na eleição APENAS UMA VEZ para obter sua identidade
+        String myNodePath;
+        try {
+            myNodePath = createElectionNode(electionRoot, workerId);
+            System.out.println(workerId + " entrou na eleicao com o no: " + myNodePath.substring(electionRoot.length() + 1));
+        } catch (KeeperException | InterruptedException e) {
+            System.err.println("Worker " + workerId + " nao conseguiu entrar na eleicao.");
+            e.printStackTrace();
+            return;
+        }
 
+
+        // 3. Loop principal de verificação de liderança
         while (true) {
-			try {
-				// 2. Anuncia a disponibilidade
-				System.out.println(workerId + " esta disponivel em " + activeWorkersRoot);
-				try {
-					zk.create(activeWorkerPath, new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
-				} catch (KeeperException.NodeExistsException e) {
-					// OK. O nó já existe de uma iteração anterior que falhou. Apenas continue.
-					System.out.println("AVISO: No de status '" + activeWorkerPath + "' ja existe. O worker esta se recuperando de um estado anterior.");
-				}
+            try {
+                // Com a identidade já estabelecida, apenas verifica se é o líder
+                if (isLeader(electionRoot, myNodePath)) {
+                    // *** LÓGICA DO LÍDER ***
+                    System.out.println(">>>> " + workerId + " assumiu a LIDERANCA! <<<<");
+                    leaderLoop(new Queue(zkAddress, queueRoot), new Lock(zkAddress, lockRoot), workerId);
+                    // O líder fica preso em `leaderLoop` até cair. Se ele sair
+                    // daqui por uma exceção não fatal, algo está errado, então saímos.
+                    break;
+                } else {
+                    // *** LÓGICA DO SEGUIDOR ***
+                    // Vigia o predecessor. Bloqueia até que ele caia.
+                    watchPredecessor(electionRoot, myNodePath);
+                    // Ao acordar, o loop recomeça para reavaliar a liderança
+                    // com o MESMO `myNodePath`.
+                    System.out.println(workerId + ": O lider/predecessor caiu. Tentando nova eleicao...");
+                }
+            } catch (KeeperException.SessionExpiredException e) {
+                System.err.println("Sessao com Zookeeper expirada. Encerrando.");
+                return;
+            } catch (KeeperException | InterruptedException e) {
+                System.err.println("Worker " + workerId + " encontrou um erro. Reiniciando checagem em 5s.");
+                e.printStackTrace();
+                try { Thread.sleep(5000); } catch (InterruptedException ie) {}
+            }
+        }
+    }
 
-				// 3. Consume um ticket (bloqueia aqui se a fila estiver vazia)
-				int ticket = ticketQueue.consume();
-				System.out.println(workerId + " pegou o ticket: " + ticket);
+    /**
+     * O loop de trabalho exclusivo do líder.
+     */
+    public static void leaderLoop(Queue ticketQueue, Lock workLock, String workerId) throws KeeperException, InterruptedException {
+        while (true) {
+            String ticket = ticketQueue.consume();
+            System.out.println("LIDER (" + workerId + ") pegou o ticket: " + ticket);
 
-				// 4. Uma vez que o ticket foi pego, fica "indisponível"
-				System.out.println(workerId + " esta ocupado, removendo de " + activeWorkersRoot);
-				zk.delete(activeWorkerPath, -1);
-				
-				// 5. Adquire o lock para sinalizar que está "travado" no processamento
-				workLock.lock();
-				
-				// 6. Processa o ticket (simula trabalho)
-				System.out.println(workerId + " esta processando o ticket (trabalho de 10s)...");
-				Thread.sleep(10000);
-				System.out.println(">>>> " + workerId + ": ticket respondido <<<<");
+            workLock.lock();
+            System.out.println("LIDER (" + workerId + ") esta processando o ticket (trabalho de 10s)...");
+            Thread.sleep(10000);
+            System.out.println(">>>> LIDER (" + workerId + "): " + ticket + " respondido <<<<");
+            workLock.unlock();
+        }
+    }
 
-				// 7. Libera o lock
-				workLock.unlock();
+    /**
+     * Cria o nó para participar da eleição.
+     */
+    public static String createElectionNode(String electionRoot, String workerId) throws KeeperException, InterruptedException {
+        return zk.create(electionRoot + "/node-", workerId.getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL_SEQUENTIAL);
+    }
 
-			} catch (KeeperException.NoNodeException e) {
-				System.err.println(workerId + ": no do worker ativo desapareceu. Tentando recriar no proximo loop.");
-			} catch (KeeperException | InterruptedException e) {
-				// Captura outras exceções
-				e.printStackTrace();
-				// Espera um pouco para não sobrecarregar em caso de erros repetidos
-				try { Thread.sleep(5000); } catch (InterruptedException ie) {}
-			}
-		}
+    /**
+     * Verifica se o nó atual é o líder (o primeiro da lista).
+     */
+    public static boolean isLeader(String electionRoot, String myNodePath) throws KeeperException, InterruptedException {
+        List<String> children = zk.getChildren(electionRoot, false);
+        Collections.sort(children);
+        String myNodeName = myNodePath.substring(electionRoot.length() + 1);
+        return children.get(0).equals(myNodeName);
+    }
+
+    /**
+     * Coloca uma vigilância no nó predecessor e bloqueia até que ele seja deletado.
+     */
+    public static void watchPredecessor(String electionRoot, String myNodePath) throws KeeperException, InterruptedException {
+        String myNodeName = myNodePath.substring(electionRoot.length() + 1);
+        
+        // Loop para garantir que estamos vigiando o nó correto
+        while(true) {
+            List<String> children = zk.getChildren(electionRoot, false);
+            Collections.sort(children);
+            int myIndex = children.indexOf(myNodeName);
+
+            // Se meu nó desapareceu por algum motivo, sai para o loop principal tentar de novo
+            if (myIndex == -1) {
+                 System.err.println("Nao encontrei meu no ("+myNodeName+"). Saindo da vigilia.");
+                 return;
+            }
+            // Se eu sou o líder agora, não preciso vigiar ninguém
+            if (myIndex == 0) {
+                return;
+            }
+
+            String predecessorName = children.get(myIndex - 1);
+            
+            synchronized (mutex) {
+                Stat stat = zk.exists(electionRoot + "/" + predecessorName, true);
+                if (stat != null) {
+                    System.out.println("Seguidor " + myNodeName + " esta vigiando " + predecessorName);
+                    mutex.wait(); // Espera a notificação
+                    return; // Retorna ao ser notificado
+                }
+                // Se o stat for nulo, o predecessor caiu antes de conseguirmos vigiá-lo.
+                // O loop while(true) interno tentará novamente.
+            }
+        }
     }
 }
