@@ -102,9 +102,9 @@ public class LeMansRace implements Watcher {
         }
     }
 
-    static public class LapTracker extends LeMansRace {
+    static public class TimeTracker extends LeMansRace {
 
-        LapTracker(String address, String name) {
+        TimeTracker(String address, String name) {
             super(address);
             this.root = name;
 
@@ -122,34 +122,34 @@ public class LeMansRace implements Watcher {
             }
         }
 
-        boolean createLap(int lapNumber) throws KeeperException, InterruptedException{
+        boolean createTime(int timeNumber) throws KeeperException, InterruptedException{
             ByteBuffer b = ByteBuffer.allocate(4);
             byte[] value;
 
-            b.putInt(lapNumber);
+            b.putInt(timeNumber);
             value = b.array();
-            zk.create(root + "/lap-", value, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_SEQUENTIAL);
+            zk.create(root + "/tempo-", value, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_SEQUENTIAL);
 
             return true;
         }
 
-        String completeLap() throws KeeperException, InterruptedException{
+        String completeTime() throws KeeperException, InterruptedException{
             Stat stat = null;
 
             while (true) {
                 synchronized (mutex) {
                     List<String> list = zk.getChildren(root, true);
                     if (list.size() == 0) {
-                        System.out.println("Nenhuma volta restante, aguardando o cronômetro...");
+                        System.out.println("O timer chegou ao fim, corrida finalizada.");
                         mutex.wait();
                     } else {
                         Collections.sort(list);
-                        String lapNode = list.get(0);
+                        String timeNode = list.get(0);
                         
-                        System.out.println("Volta a ser completada: " + lapNode);
-                        zk.getData(root + "/" + lapNode, false, stat);
-                        zk.delete(root + "/" + lapNode, -1);
-                        return lapNode;
+                        System.out.println("Tempo a ser completado: " + timeNode);
+                        zk.getData(root + "/" + timeNode, false, stat);
+                        zk.delete(root + "/" + timeNode, -1);
+                        return timeNode;
                     }
                 }
             }
@@ -166,7 +166,7 @@ public class LeMansRace implements Watcher {
         }
 
         public void acquireTrack() throws KeeperException, InterruptedException {
-            pathName = zk.create(root + "/car-", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL_SEQUENTIAL);
+            pathName = zk.create(root + "/lock-", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL_SEQUENTIAL);
             System.out.println("Tentando adquirir o lock da pista com o nó " + pathName);
 
             while (true) {
@@ -202,25 +202,25 @@ public class LeMansRace implements Watcher {
     
     public static void main(String args[]) {
         if (args.length == 0) {
-            System.err.println("Por favor, especifique uma opção: lapProducer, racer");
+            System.err.println("Por favor, especifique uma opção: timeProducer, racer");
             return;
         }
-        if (args[0].equals("lapProducer"))
-            lapProducerTest(args);
+        if (args[0].equals("timeProducer"))
+            timeProducerTest(args);
         else if (args[0].equals("racer"))
             racerProcess(args);
         else
         	System.err.println("Opção desconhecida: " + args[0]);
     }
 
-    public static void lapProducerTest(String args[]) {
-        LapTracker lt = new LapTracker(args[1], "/laps");
+    public static void timeProducerTest(String args[]) {
+        TimeTracker lt = new TimeTracker(args[1], "/timer");
         Integer max = Integer.valueOf(args[2]);
 
-        System.out.println("Produtor de Voltas (Cronômetro)");
+        System.out.println("Produtor do Timer");
 		for (int i = 0; i < max; i++)
 			try{
-				lt.createLap(i + 1);
+				lt.createTime(i + 1);
 			} catch (KeeperException | InterruptedException e){
 				e.printStackTrace();
 			}
@@ -234,7 +234,7 @@ public class LeMansRace implements Watcher {
         String zkAddress = args[1];
         int racerCount = Integer.valueOf(args[2]);
         String barrierRoot = "/starting-grid";
-        String queueRoot = "/laps";
+        String queueRoot = "/timer";
         String lockRoot = "/track-lock";
         String electionRoot = "/race-election";
         String racerId = "racer-" + new Random().nextInt(100000);
@@ -279,11 +279,11 @@ public class LeMansRace implements Watcher {
             try {
                 if (isLeader(electionRoot, myNodePath)) {
                     System.out.println(">>>> " + racerId + " assumiu a LIDERANÇA! <<<<");
-                    raceAsLeaderLoop(new LapTracker(zkAddress, queueRoot), new TrackLock(zkAddress, lockRoot), racerId);
+                    raceAsLeaderLoop(new TimeTracker(zkAddress, queueRoot), new TrackLock(zkAddress, lockRoot), racerId);
                     break;
                 } else {
                     watchPredecessor(electionRoot, myNodePath);
-                    System.out.println(racerId + ": O líder/corredor predecessor caiu. Tentando nova eleição...");
+                    System.out.println(racerId + ": O líder/corredor cansou. Tentando nova eleição...");
                 }
             } catch (KeeperException.SessionExpiredException e) {
                 System.err.println("Sessão com o Zookeeper expirou. Encerrando.");
@@ -296,15 +296,14 @@ public class LeMansRace implements Watcher {
         }
     }
 
-    public static void raceAsLeaderLoop(LapTracker lapTracker, TrackLock trackLock, String racerId) throws KeeperException, InterruptedException {
+    public static void raceAsLeaderLoop(TimeTracker TimeTracker, TrackLock trackLock, String racerId) throws KeeperException, InterruptedException {
         while (true) {
-            String lap = lapTracker.completeLap();
-            System.out.println("CORREDOR LÍDER (" + racerId + ") completou a volta: " + lap);
+            String time = TimeTracker.completeTime();
 
             trackLock.acquireTrack();
-            System.out.println("CORREDOR LÍDER (" + racerId + ") está na pista (simulando 10s de trabalho)...");
+            System.out.println("CORREDOR LÍDER (" + racerId + ") está na pista (simulando 1h de trabalho)...");
             Thread.sleep(10000);
-            System.out.println(">>>> CORREDOR LÍDER (" + racerId + "): finalizou a volta " + lap + " <<<<");
+            System.out.println(">>>> CORREDOR LÍDER (" + racerId + "): finalizou o tempo " + time + " <<<<");
             trackLock.releaseTrack();
         }
     }
